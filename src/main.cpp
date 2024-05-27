@@ -120,10 +120,12 @@ void setup() {
   // Add overlays
   ui.setOverlays(overlays, overlaysCount);
 
-  // Initialising the UI will init the display too.
-  ui.init();
+  if (esp_sleep_get_ext1_wakeup_status() > 0) {
+    // Initialising the UI will init the display too.
+    ui.init();
 
-  ui.update();
+    ui.update();
+  }
 
 
   // Obtain directly after deep sleep
@@ -154,7 +156,7 @@ void sendLoRaMessage() {
     return;
   }
 
-  if (node->timeUntilUplink() > 0 || lastMessage < millis() - (MINIMUM_DELAY * 1000)) {
+  if (node->timeUntilUplink() > 0 || lastMessage > millis() - (MINIMUM_DELAY * 1000)) {
     return;
   }
 
