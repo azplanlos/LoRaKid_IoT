@@ -15,7 +15,7 @@
 */
 
 
-// Pause between sends in seconds, so this is every 15 minutes. (Delay will be
+// Pause between sends in seconds, so this is every 1 minute. (Delay will be
 // longer if regulatory or TTN Fair Use Policy requires it.)
 #define MINIMUM_DELAY 60 
 
@@ -23,6 +23,7 @@
 #include <LoRaWAN_ESP32.h>
 #include <messageFromKid.pb.h>
 #include <pb_encode.h>
+#include <LinkedList.h>
 
 LoRaWANNode* node;
 
@@ -31,6 +32,8 @@ RTC_DATA_ATTR uint8_t count = 0;
 #include "images.h"
 
 OLEDDisplayUi ui     ( &display );
+
+LinkedList<persist_KidPayload*> messagesToSend = LinkedList<persist_KidPayload*>();
 
 void goToSleep() {
   Serial.println("Going to deep sleep now");
@@ -92,7 +95,11 @@ OverlayCallback overlays[] = { msOverlay };
 int overlaysCount = 1;
 
 long lastMessage = 0;
+
+int8_t lastCode = 0;
+
 HotButton b1 = HotButton(GPIO_NUM_6, true);
+HotButton b4 = HotButton(GPIO_NUM_4, true);
 
 void setup() {
   heltec_setup();
@@ -132,12 +139,6 @@ void setup() {
     ui.update();
   }
 
-
-  // Obtain directly after deep sleep
-  // May or may not reflect room temperature, sort of. 
-  float temp = heltec_temperature();
-  both.printf("Temperature: %.1f °C\n", temp);
-
   // initialize radio
   Serial.println("Radio init");
   int16_t state = radio.begin();
@@ -147,7 +148,32 @@ void setup() {
   }
 }
 
+bool payloadEncodeCb(pb_ostream_t *stream, const pb_field_t *field,
+    void * const *arg) {
+  Serial.printf("called, field->tag=%d field->type=%d", field->tag, field->type);
+
+  while (messagesToSend.size() > 0) {
+    persist_KidPayload* paylad = messagesToSend.shift();
+    if(pb_encode_tag_for_field(stream, field) == false) {
+        Serial.println("encode failed");
+        return false;
+    }
+    
+    if(pb_encode_submessage(stream, persist_KidPayload_fields, paylad) == false) {
+        Serial.println("encode failed");
+        return false;
+      }
+  }
+  return true;
+}
+
 void sendLoRaMessage() {
+
+  if (messagesToSend.size() <= 0) {
+    // noting to send
+    return;
+  }
+
   if (!(node && node->isJoined())) {
     node = persist.manage(&radio);
     // Manages uplink intervals to the TTN Fair Use Policy
@@ -166,9 +192,13 @@ void sendLoRaMessage() {
   }
 
   // If we're still here, it means we joined, and we can send something
+  Serial.printf("sending %i messages\n", messagesToSend.size());
+
   persist_MessageFromKid message = {
     heltec_battery_percent()
   };
+  message.payload.funcs.encode = payloadEncodeCb;
+
   uint8_t uplinkData[256];
   Serial.println("battery: " + message.batteryLevel);
 
@@ -188,7 +218,6 @@ void sendLoRaMessage() {
   } else {
     Serial.printf("sendReceive returned error %d, we'll try again later.\n", state);
   }
-
 }
 
 void loop() {
@@ -203,6 +232,7 @@ void loop() {
     long usedMillis = millis();
     heltec_loop();
     b1.update();
+    b4.update();
 
     if (button.pressedFor(1000)) {
       goToSleep();
@@ -210,6 +240,15 @@ void loop() {
     if (b1.pressedFor(200)) {
       Serial.println("next screen");
       ui.nextFrame();
+    }
+
+    if (b4.pressedFor(200)) {
+      Serial.println("add message");
+      persist_KidPayload message = persist_KidPayload_init_zero;
+      message.code = lastCode;
+      message.subSelection = 1;
+      lastCode++;
+      messagesToSend.add(&message);
     }
 
     sendLoRaMessage();
@@ -220,7 +259,7 @@ void loop() {
     delay(interval);
   }
 
-  if (millis() > 180000) {
+  if (millis() > 180000 && messagesToSend.size() == 0) {
     goToSleep();
   }
 }
