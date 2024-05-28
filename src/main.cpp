@@ -21,6 +21,8 @@
 
 #include <heltec_unofficial.h>
 #include <LoRaWAN_ESP32.h>
+#include <messageFromKid.pb.h>
+#include <pb_encode.h>
 
 LoRaWANNode* node;
 
@@ -90,6 +92,7 @@ OverlayCallback overlays[] = { msOverlay };
 int overlaysCount = 1;
 
 long lastMessage = 0;
+HotButton b1 = HotButton(GPIO_NUM_6, true);
 
 void setup() {
   heltec_setup();
@@ -98,6 +101,8 @@ void setup() {
   // but that won't give you much time for anything else
   // run it in 160Mhz mode or just set it to 30 fps
   ui.setTargetFPS(15);
+
+  ui.disableAutoTransition();
 
   // Customize the active and inactive symbol
   ui.setActiveSymbol(activeSymbol);
@@ -161,14 +166,20 @@ void sendLoRaMessage() {
   }
 
   // If we're still here, it means we joined, and we can send something
+  persist_MessageFromKid message = {
+    heltec_battery_percent()
+  };
+  uint8_t uplinkData[256];
+  Serial.println("battery: " + message.batteryLevel);
 
-  uint8_t uplinkData[2];
-  uplinkData[0] = count++;
+  pb_ostream_t ostream;
+  ostream = pb_ostream_from_buffer(uplinkData, sizeof(uplinkData));
+  pb_encode(&ostream, &persist_MessageFromKid_msg, &message);
 
   uint8_t downlinkData[256];
   size_t lenDown = sizeof(downlinkData);
 
-  int16_t state = node->sendReceive(uplinkData, sizeof(uplinkData), 1, downlinkData, &lenDown);
+  int16_t state = node->sendReceive(uplinkData, ostream.bytes_written, 1, downlinkData, &lenDown);
 
   lastMessage = millis();
 
@@ -191,9 +202,16 @@ void loop() {
     // time budget.
     long usedMillis = millis();
     heltec_loop();
+    b1.update();
+
     if (button.pressedFor(1000)) {
       goToSleep();
     }
+    if (b1.pressedFor(200)) {
+      Serial.println("next screen");
+      ui.nextFrame();
+    }
+
     sendLoRaMessage();
     long interval = remainingTimeBudget - (millis() - usedMillis);
     if (interval <= 0) {
