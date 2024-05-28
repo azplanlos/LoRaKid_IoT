@@ -34,6 +34,7 @@ RTC_DATA_ATTR uint8_t count = 0;
 OLEDDisplayUi ui     ( &display );
 
 LinkedList<persist_KidPayload*> messagesToSend = LinkedList<persist_KidPayload*>();
+LinkedList<persist_KidPayload*> messageBuffer = LinkedList<persist_KidPayload*>();
 
 void goToSleep() {
   Serial.println("Going to deep sleep now");
@@ -151,18 +152,28 @@ void setup() {
 bool payloadEncodeCb(pb_ostream_t *stream, const pb_field_t *field,
     void * const *arg) {
   Serial.printf("called, field->tag=%d field->type=%d", field->tag, field->type);
+  uint8_t encoded = 0;
+  while (messageBuffer.size() > 0) {
+    persist_KidPayload* bufferMsg = messagesToSend.shift();
+    delete(bufferMsg);
+  }
+  
 
-  while (messagesToSend.size() > 0) {
-    persist_KidPayload* paylad = messagesToSend.shift();
+  while (messagesToSend.size() > 0 && encoded <= 3) {
+    persist_KidPayload* payload = messagesToSend.shift();
+    messageBuffer.add(payload);
+
     if(pb_encode_tag_for_field(stream, field) == false) {
         Serial.println("encode failed");
         return false;
     }
     
-    if(pb_encode_submessage(stream, persist_KidPayload_fields, paylad) == false) {
+    if(pb_encode_submessage(stream, persist_KidPayload_fields, payload) == false) {
         Serial.println("encode failed");
         return false;
       }
+    delete(payload);
+    encoded++;
   }
   return true;
 }
@@ -174,7 +185,7 @@ void sendLoRaMessage() {
     return;
   }
 
-  if (!(node && node->isJoined())) {
+  if (!(node && node->isJoined() || lastMessage > millis() - (MINIMUM_DELAY * 1000))) {
     node = persist.manage(&radio);
     // Manages uplink intervals to the TTN Fair Use Policy
     if (node->isJoined()) { 
@@ -187,7 +198,7 @@ void sendLoRaMessage() {
     return;
   }
 
-  if (node->timeUntilUplink() > 0 || lastMessage > millis() - (MINIMUM_DELAY * 1000)) {
+  if (node->timeUntilUplink() > 0) {
     return;
   }
 
@@ -217,6 +228,9 @@ void sendLoRaMessage() {
     Serial.println("Message sent");
   } else {
     Serial.printf("sendReceive returned error %d, we'll try again later.\n", state);
+    for (int8_t i = 0; i < messageBuffer.size(); i++) {
+      messagesToSend.unshift(messageBuffer.get(i));
+    }
   }
 }
 
