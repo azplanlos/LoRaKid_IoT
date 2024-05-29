@@ -1,4 +1,4 @@
-23336283767696402
+23334566863775695
 Audio_Module
 Reverb_BTDR-1H
 Digital Reverberation Unit, http://www.belton.co.kr/inc/downfile.php?seq=17&file=pdf (footprint from http://www.uk-electronic.de/PDF/BTDR-1.pdf)
@@ -66296,13 +66296,6 @@ net tie
 0
 4
 4
-Node
-Heltec LoRa 32 V3
-
-
-0
-36
-36
 OptoDevice
 ADNS-9800
 Laser Gaming Sensor ADNS-9800
