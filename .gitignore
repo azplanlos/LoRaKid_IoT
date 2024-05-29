@@ -5,4 +5,5 @@
 .vscode/ipch
 
 board/*-backups
+board/LoRaKid-backups
 board/*.lck
