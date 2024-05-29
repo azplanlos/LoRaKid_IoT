@@ -4,6 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 
-board/*-backups
-board/LoRaKid-backups
+board/LoRaKid/*-backups
 board/*.lck
