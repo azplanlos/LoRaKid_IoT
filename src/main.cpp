@@ -24,6 +24,10 @@
 #include <messageFromKid.pb.h>
 #include <pb_encode.h>
 #include <LinkedList.h>
+#include <Preferences.h>
+#include <ESP32Time.h>
+#include <WiFi.h>
+#include <NTP.h>
 
 LoRaWANNode* node;
 
@@ -33,16 +37,32 @@ RTC_DATA_ATTR uint8_t count = 0;
 
 OLEDDisplayUi ui     ( &display );
 
-LinkedList<persist_KidPayload*> messagesToSend = LinkedList<persist_KidPayload*>();
-LinkedList<persist_KidPayload*> messageBuffer = LinkedList<persist_KidPayload*>();
+LinkedList<Payload_KidPayload*> messagesToSend = LinkedList<Payload_KidPayload*>();
+LinkedList<Payload_KidPayload*> messageBuffer = LinkedList<Payload_KidPayload*>();
+Preferences* prefs = new Preferences();
+const char* TIMEZONE_OFFSET_KEY = "tzo";
+
+long lastMessage = 0;
+
+int8_t lastCode = 0;
+
+HotButton b1 = HotButton(GPIO_NUM_6, true);
+HotButton b4 = HotButton(GPIO_NUM_4, true);
+
+bool active = false;
+
+ESP32Time rtc;
+WiFiUDP wifiUdp;
+NTP ntp(wifiUdp);
 
 void goToSleep() {
   Serial.println("Going to deep sleep now");
   // allows recall of the session after deepsleep
-  persist.saveSession(node);
+  if (node) persist.saveSession(node);
   Serial.printf("Next wakeup in %i s\n", MINIMUM_DELAY);
   esp_sleep_enable_ext0_wakeup(BUTTON, LOW);
   button.waitForRelease();
+  prefs->end();
   delay(100);  // So message prints
   // and off to bed we go
   heltec_deep_sleep(MINIMUM_DELAY);
@@ -53,7 +73,7 @@ char voltBuf[6];
 void msOverlay(OLEDDisplay *display, OLEDDisplayUiState* state) {
   display->setTextAlignment(TEXT_ALIGN_RIGHT);
   display->setFont(ArialMT_Plain_10);
-  display->drawString(128, 0, String(millis()));
+  display->drawString(128, 0, String(rtc.getTime("%H:%M")));
   display->setTextAlignment(TEXT_ALIGN_LEFT);
   display->drawStringf(0, 0, voltBuf, "%i %%", heltec_battery_percent());
 }
@@ -95,15 +115,9 @@ int frameCount = 4;
 OverlayCallback overlays[] = { msOverlay };
 int overlaysCount = 1;
 
-long lastMessage = 0;
-
-int8_t lastCode = 0;
-
-HotButton b1 = HotButton(GPIO_NUM_6, true);
-HotButton b4 = HotButton(GPIO_NUM_4, true);
-
 void setup() {
   heltec_setup();
+  prefs->begin("loraKid");
 
   // The ESP is capable of rendering 60fps in 80Mhz mode
   // but that won't give you much time for anything else
@@ -133,20 +147,47 @@ void setup() {
   // Add overlays
   ui.setOverlays(overlays, overlaysCount);
 
-  if (esp_sleep_get_ext1_wakeup_status() > 0) {
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 || esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    active = true;
+
     // Initialising the UI will init the display too.
     ui.init();
-
+    
     ui.update();
+
+  } else {
+    heltec_display_power(false);
+    Serial.println(F("wakeup due to heartbeat"));
   }
 
   // initialize radio
   Serial.println("Radio init");
   int16_t state = radio.begin();
   if (state != RADIOLIB_ERR_NONE) {
-    both.println("Radio did not initialize. We'll try again later.");
+    both.println(F("Radio did not initialize. We'll try again later."));
     delay(2000);
   }
+
+  String ssid = prefs->getString("ssid");
+  String wifipw = prefs->getString("wifipw");
+  if (ssid.length() == 0) {
+    Serial.setTimeout(15000);
+    Serial.print("Bitte WLAN SSID eingeben: ");
+    ssid = Serial.readStringUntil('\n');
+    Serial.print("Bitte WLAN Passwort eingeben: ");
+    wifipw = Serial.readStringUntil('\n');
+    if (ssid.length() > 0 && wifipw.length() > 0) {
+      prefs->putString("ssid", ssid);
+      prefs->putString("wifipw", wifipw);
+    }
+  }
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(ssid, wifipw);
+
+  rtc.offset = prefs->getLong(TIMEZONE_OFFSET_KEY);
 }
 
 bool payloadEncodeCb(pb_ostream_t *stream, const pb_field_t *field,
@@ -154,13 +195,13 @@ bool payloadEncodeCb(pb_ostream_t *stream, const pb_field_t *field,
   Serial.printf("called, field->tag=%d field->type=%d", field->tag, field->type);
   uint8_t encoded = 0;
   while (messageBuffer.size() > 0) {
-    persist_KidPayload* bufferMsg = messagesToSend.shift();
+    Payload_KidPayload* bufferMsg = messagesToSend.shift();
     delete(bufferMsg);
   }
   
 
   while (messagesToSend.size() > 0 && encoded <= 3) {
-    persist_KidPayload* payload = messagesToSend.shift();
+    Payload_KidPayload* payload = messagesToSend.shift();
     messageBuffer.add(payload);
 
     if(pb_encode_tag_for_field(stream, field) == false) {
@@ -168,7 +209,7 @@ bool payloadEncodeCb(pb_ostream_t *stream, const pb_field_t *field,
         return false;
     }
     
-    if(pb_encode_submessage(stream, persist_KidPayload_fields, payload) == false) {
+    if(pb_encode_submessage(stream, Payload_KidPayload_fields, payload) == false) {
         Serial.println("encode failed");
         return false;
       }
@@ -185,16 +226,16 @@ void sendLoRaMessage() {
     return;
   }
 
-  if (!(node && node->isJoined() || lastMessage > millis() - (MINIMUM_DELAY * 1000))) {
+  if (!(node && node->isActivated() || lastMessage > millis() - (MINIMUM_DELAY * 1000))) {
     node = persist.manage(&radio);
     // Manages uplink intervals to the TTN Fair Use Policy
-    if (node->isJoined()) { 
+    if (node->isActivated()) { 
       node->setDutyCycle(true, 1250);
     }
   }
 
-  if (!node->isJoined()) {
-    both.println("Could not join network. We'll try again later.");
+  if (!node->isActivated()) {
+    both.println(F("Could not join network. We'll try again later."));
     return;
   }
 
@@ -205,7 +246,7 @@ void sendLoRaMessage() {
   // If we're still here, it means we joined, and we can send something
   Serial.printf("sending %i messages\n", messagesToSend.size());
 
-  persist_MessageFromKid message = {
+  Payload_MessageFromKid message = {
     heltec_battery_percent()
   };
   message.payload.funcs.encode = payloadEncodeCb;
@@ -215,7 +256,7 @@ void sendLoRaMessage() {
 
   pb_ostream_t ostream;
   ostream = pb_ostream_from_buffer(uplinkData, sizeof(uplinkData));
-  pb_encode(&ostream, &persist_MessageFromKid_msg, &message);
+  pb_encode(&ostream, &Payload_MessageFromKid_msg, &message);
 
   uint8_t downlinkData[256];
   size_t lenDown = sizeof(downlinkData);
@@ -248,7 +289,7 @@ void loop() {
     b1.update();
     b4.update();
 
-    if (button.pressedFor(1000)) {
+    if (button.pressedFor(500)) {
       goToSleep();
     }
     if (b1.pressedFor(200)) {
@@ -258,12 +299,33 @@ void loop() {
 
     if (b4.pressedFor(200)) {
       Serial.println("add message");
-      persist_KidPayload message = persist_KidPayload_init_zero;
+      Payload_KidPayload message = Payload_KidPayload_init_zero;
       message.code = lastCode;
       message.subSelection = 1;
       lastCode++;
       messagesToSend.add(&message);
     }
+
+    if (WiFi.status() == WL_CONNECTED && (rtc.getEpoch() < 20000 || prefs->getBool("ntp") == false)) {
+      Serial.println(WiFi.localIP());
+      ntp.ruleDST("CEST", Last, Sun, Mar, 2, 120); // last sunday in march 2:00, timetone +120min (+1 GMT + 1h summertime offset)
+      ntp.ruleSTD("CET", Last, Sun, Oct, 3, 60); // last sunday in october 3:00, timezone +60min (+1 GMT)
+      ntp.begin();
+      ntp.update();
+      rtc.setTime(ntp.epoch());
+      if (rtc.offset == 0) {
+        long offset = (ntp.hours() - rtc.getHour(true)) * 60 * 60;
+        rtc.offset = offset;
+        prefs->putLong(TIMEZONE_OFFSET_KEY, offset);
+      }
+      Serial.println("offset: " + String(rtc.offset));
+      Serial.println(ntp.hours() + "-" + rtc.getHour(true));
+      Serial.println(rtc.getDateTime());
+      prefs->putBool("ntp", true);
+      ntp.stop();
+    }
+
+    // TODO: Einmal pro Tag NTP zurücksetzen und neu synchronisieren, falls WLAN vorhanden
 
     sendLoRaMessage();
     long interval = remainingTimeBudget - (millis() - usedMillis);
@@ -273,7 +335,13 @@ void loop() {
     delay(interval);
   }
 
-  if (millis() > 180000 && messagesToSend.size() == 0) {
+  unsigned long waitTime = 10000;
+
+  if (active) {
+    waitTime = 180000;
+  }
+
+  if (millis() > waitTime && messagesToSend.size() == 0) {
     goToSleep();
   }
 }
