@@ -41,6 +41,7 @@ LinkedList<Payload_KidPayload*> messagesToSend = LinkedList<Payload_KidPayload*>
 LinkedList<Payload_KidPayload*> messageBuffer = LinkedList<Payload_KidPayload*>();
 Preferences* prefs = new Preferences();
 const char* TIMEZONE_OFFSET_KEY = "tzo";
+const char* HEARTBEAT = "hb";
 
 long lastMessage = 0;
 
@@ -55,6 +56,8 @@ ESP32Time rtc;
 WiFiUDP wifiUdp;
 NTP ntp(wifiUdp);
 
+long lastHeartbeat = 0;
+
 void goToSleep() {
   Serial.println("Going to deep sleep now");
   // allows recall of the session after deepsleep
@@ -62,6 +65,7 @@ void goToSleep() {
   Serial.printf("Next wakeup in %i s\n", MINIMUM_DELAY);
   esp_sleep_enable_ext0_wakeup(BUTTON, LOW);
   button.waitForRelease();
+  prefs->putLong(HEARTBEAT, lastHeartbeat);
   prefs->end();
   delay(100);  // So message prints
   // and off to bed we go
@@ -161,6 +165,10 @@ void setup() {
     Serial.println(F("wakeup due to heartbeat"));
   }
 
+  lastHeartbeat = prefs->getLong(HEARTBEAT);
+
+  Serial.println("last heartbeat: " + String(lastHeartbeat));
+
   // initialize radio
   Serial.println("Radio init");
   int16_t state = radio.begin();
@@ -219,13 +227,7 @@ bool payloadEncodeCb(pb_ostream_t *stream, const pb_field_t *field,
   return true;
 }
 
-void sendLoRaMessage() {
-
-  if (messagesToSend.size() <= 0) {
-    // noting to send
-    return;
-  }
-
+bool joinAndCheckDutyCycle() {
   if (!(node && node->isActivated() || lastMessage > millis() - (MINIMUM_DELAY * 1000))) {
     node = persist.manage(&radio);
     // Manages uplink intervals to the TTN Fair Use Policy
@@ -236,10 +238,48 @@ void sendLoRaMessage() {
 
   if (!node->isActivated()) {
     both.println(F("Could not join network. We'll try again later."));
-    return;
+    return false;
   }
 
   if (node->timeUntilUplink() > 0) {
+    return false;
+  }
+  return true;
+}
+
+int16_t encodeAndSendMessage(const void* message, const pb_msgdesc_t* msgType) {
+  uint8_t uplinkData[256];
+  pb_ostream_t ostream;
+  ostream = pb_ostream_from_buffer(uplinkData, sizeof(uplinkData));
+  pb_encode(&ostream, msgType, &message);
+
+  uint8_t downlinkData[256];
+  size_t lenDown = sizeof(downlinkData);
+  Serial.printf("sent %i bytes\n", ostream.bytes_written);
+
+  int16_t state = node->sendReceive(uplinkData, ostream.bytes_written, 1, downlinkData, &lenDown);
+
+  // Serial.printf("received %i bytes%n", lenDown);
+
+  lastMessage = millis();
+  return state;
+}
+
+void sendLoRaHeartbeat() {
+  if (lastHeartbeat <= rtc.getEpoch() - (15 * 60) && joinAndCheckDutyCycle()) {
+    lastHeartbeat = rtc.getEpoch();
+    Payload_Heartbeat message = {
+      heltec_battery_percent(),
+      static_cast<int>(heltec_temperature())
+    };
+    uint16_t state = encodeAndSendMessage(&message, &Payload_Heartbeat_msg);
+  }
+}
+
+void sendLoRaMessage() {
+
+  if (messagesToSend.size() <= 0 || !joinAndCheckDutyCycle()) {
+    // noting to send
     return;
   }
 
@@ -249,21 +289,11 @@ void sendLoRaMessage() {
   Payload_MessageFromKid message = {
     heltec_battery_percent()
   };
-  message.payload.funcs.encode = payloadEncodeCb;
-
-  uint8_t uplinkData[256];
   Serial.println("battery: " + message.batteryLevel);
 
-  pb_ostream_t ostream;
-  ostream = pb_ostream_from_buffer(uplinkData, sizeof(uplinkData));
-  pb_encode(&ostream, &Payload_MessageFromKid_msg, &message);
+  message.payload.funcs.encode = payloadEncodeCb;
 
-  uint8_t downlinkData[256];
-  size_t lenDown = sizeof(downlinkData);
-
-  int16_t state = node->sendReceive(uplinkData, ostream.bytes_written, 1, downlinkData, &lenDown);
-
-  lastMessage = millis();
+  uint16_t state = encodeAndSendMessage(&message, &Payload_MessageFromKid_msg);
 
   if(state == RADIOLIB_ERR_NONE || state == RADIOLIB_ERR_RX_TIMEOUT) {
     Serial.println("Message sent");
@@ -326,6 +356,8 @@ void loop() {
     }
 
     // TODO: Einmal pro Tag NTP zurücksetzen und neu synchronisieren, falls WLAN vorhanden
+
+    sendLoRaHeartbeat();
 
     sendLoRaMessage();
     long interval = remainingTimeBudget - (millis() - usedMillis);
