@@ -23,11 +23,16 @@
 #include <LoRaWAN_ESP32.h>
 #include <messageFromKid.pb.h>
 #include <pb_encode.h>
+#include <pb_decode.h>
 #include <LinkedList.h>
 #include <Preferences.h>
 #include <ESP32Time.h>
 #include <WiFi.h>
 #include <NTP.h>
+#include <TimeLib.h>
+#include <LittleFS.h>
+#include "FS.h"
+#include "DejaVu_Sans_Bold_10.h"
 
 LoRaWANNode* node;
 
@@ -49,6 +54,15 @@ int8_t lastCode = 0;
 
 HotButton b1 = HotButton(GPIO_NUM_6, true);
 HotButton b4 = HotButton(GPIO_NUM_4, true);
+
+File wifiLogoFile;
+uint8_t wifiLogo[32];
+uint8_t battery[32*5];
+uint8_t messageIcon[32];
+
+char* currentMessage = "Wann kommst Du nach Hause?";
+long lastMessageScrollFrame = 0;
+int messageScrollOffset = 0;
 
 bool active = false;
 
@@ -77,9 +91,33 @@ char voltBuf[6];
 void msOverlay(OLEDDisplay *display, OLEDDisplayUiState* state) {
   display->setTextAlignment(TEXT_ALIGN_RIGHT);
   display->setFont(ArialMT_Plain_10);
-  display->drawString(128, 0, String(rtc.getTime("%H:%M")));
+  display->drawString(110, 0, String(rtc.getTime("%H:%M")));
+  display->drawXbm(112, 0, 16, 16, wifiLogo);
+  int val = (5 - (heltec_battery_percent() / 25)) * 32;
+  display->drawXbm(0, 0, 16, 16, battery + val);
+}
+
+void drawMessage(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
+  display->drawXbm(x, y + 15, 16, 16, messageIcon);
+  display->setFont(DejaVu_Sans_Bold_10);
   display->setTextAlignment(TEXT_ALIGN_LEFT);
-  display->drawStringf(0, 0, voltBuf, "%i %%", heltec_battery_percent());
+  display->drawString(x + 18, y + 17, "Papa");
+  display->drawLine(x, y + 30, x + 45, y + 30);
+  display->setFont(ArialMT_Plain_10);
+  int width = display->getStringWidth(currentMessage);
+  Serial.println(String(state->frameState) + '-' + String(width) + '-' + String(messageScrollOffset) + '-' + String(state->ticksSinceLastStateSwitch));
+  int xpos = x - messageScrollOffset;
+  if (state->frameState == FIXED) {
+    // scroll only if fixed!
+    if (lastMessageScrollFrame < state->ticksSinceLastStateSwitch - 2 || state->ticksSinceLastStateSwitch < lastMessageScrollFrame) {
+      messageScrollOffset += 2;
+      lastMessageScrollFrame = state->ticksSinceLastStateSwitch;
+    }
+  }
+  if (messageScrollOffset > width - 128 + 10) {
+    messageScrollOffset = 0;
+  }
+  int charsPrinted = display->drawString(xpos, y + 34, currentMessage);
 }
 
 void drawFrame1(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
@@ -87,7 +125,7 @@ void drawFrame1(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int1
   // Please note that everything that should be transitioned
   // needs to be drawn relative to x and y
 
-  display->drawXbm(x + 34, y + 14, WiFi_Logo_width, WiFi_Logo_height, WiFi_Logo_bits);
+  display->drawXbm(x + 34, y + 14, 16, 16, wifiLogo);
 }
 
 void drawFrame3(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
@@ -110,7 +148,7 @@ void drawFrame5(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int1
 
 // This array keeps function pointers to all frames
 // frames are the single views that slide in
-FrameCallback frames[] = { drawFrame1, drawFrame3, drawFrame4, drawFrame5 };
+FrameCallback frames[] = { drawMessage, drawFrame3, drawFrame4, drawFrame5 };
 
 // how many frames are there?
 int frameCount = 4;
@@ -122,13 +160,33 @@ int overlaysCount = 1;
 void setup() {
   heltec_setup();
   prefs->begin("loraKid");
+  LittleFS.begin(true, "/images");
+  wifiLogoFile = LittleFS.open("/wifi.xbm");
+  wifiLogoFile.read(wifiLogo, 32);
+  wifiLogoFile.close();
+
+  File batFile = LittleFS.open("/battery.xbm");
+  batFile.read(battery, 32*5);
+  batFile.close();
+
+  File msgIconFile = LittleFS.open("/envelope.xbm");
+  msgIconFile.read(messageIcon, 32);
+  msgIconFile.close();
+
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(0, GPIO_NUM_33);
+  ledcWriteNote(0, NOTE_C, 4);
+  delay(500);
+  ledcDetachPin(GPIO_NUM_33);
 
   // The ESP is capable of rendering 60fps in 80Mhz mode
   // but that won't give you much time for anything else
   // run it in 160Mhz mode or just set it to 30 fps
   ui.setTargetFPS(15);
+  ui.setTimePerFrame(24400);
 
-  ui.disableAutoTransition();
+  //ui.disableAutoTransition();
+  ui.disableAllIndicators();
 
   // Customize the active and inactive symbol
   ui.setActiveSymbol(activeSymbol);
@@ -167,8 +225,8 @@ void setup() {
 
   lastHeartbeat = prefs->getLong(HEARTBEAT);
 
-  Serial.println("last heartbeat: " + String(lastHeartbeat));
-
+  Serial.println("last heartbeat: " + String(lastHeartbeat) + " - " + hour(lastHeartbeat) + ":" + minute(lastHeartbeat));
+  
   // initialize radio
   Serial.println("Radio init");
   int16_t state = radio.begin();
@@ -251,28 +309,49 @@ int16_t encodeAndSendMessage(const void* message, const pb_msgdesc_t* msgType) {
   uint8_t uplinkData[256];
   pb_ostream_t ostream;
   ostream = pb_ostream_from_buffer(uplinkData, sizeof(uplinkData));
-  pb_encode(&ostream, msgType, &message);
-
   uint8_t downlinkData[256];
   size_t lenDown = sizeof(downlinkData);
-  Serial.printf("sent %i bytes\n", ostream.bytes_written);
+  int16_t state;
+  if (pb_encode(&ostream, msgType, message) ) {  
+    Serial.printf("sent %i bytes\n", ostream.bytes_written);
+    for (int i = 0; i < ostream.bytes_written; i++) {
+      Serial.print(String(uplinkData[i]) + " ");
+    }
+    Serial.println();
 
-  int16_t state = node->sendReceive(uplinkData, ostream.bytes_written, 1, downlinkData, &lenDown);
+    state = node->sendReceive(uplinkData, ostream.bytes_written, 1, downlinkData, &lenDown);
 
-  // Serial.printf("received %i bytes%n", lenDown);
+    if(state == RADIOLIB_ERR_NONE || state == RADIOLIB_LORAWAN_NO_DOWNLINK) {
+      Serial.println("message sent.");
+    }
 
-  lastMessage = millis();
+    if (lenDown > 0 && lenDown < 256) {
+      Serial.printf("received %i bytes\n", lenDown);
+      for (int i = 0; i < lenDown; i++) {
+        Serial.println("received: " + String(downlinkData[i]));
+      }
+    }
+
+    lastMessage = millis();
+  } else {
+    Serial.println("error encoding message!");
+  }
   return state;
 }
 
 void sendLoRaHeartbeat() {
   if (lastHeartbeat <= rtc.getEpoch() - (15 * 60) && joinAndCheckDutyCycle()) {
-    lastHeartbeat = rtc.getEpoch();
-    Payload_Heartbeat message = {
-      heltec_battery_percent(),
-      static_cast<int>(heltec_temperature())
-    };
+    Payload_Heartbeat message = Payload_Heartbeat_init_zero;
+    message.batteryLevel = (uint32_t)heltec_battery_percent();
+    message.temp = (uint32_t)heltec_temperature();
+    
+    Serial.printf("battery: %i, temperatur: %i\n", message.batteryLevel, message.temp);
     uint16_t state = encodeAndSendMessage(&message, &Payload_Heartbeat_msg);
+    if(state == RADIOLIB_ERR_NONE || state == RADIOLIB_ERR_RX_TIMEOUT) {
+      lastHeartbeat = rtc.getEpoch();
+    } else {
+      Serial.println("Error sending heartbeat");
+    }
   }
 }
 
@@ -298,7 +377,7 @@ void sendLoRaMessage() {
   if(state == RADIOLIB_ERR_NONE || state == RADIOLIB_ERR_RX_TIMEOUT) {
     Serial.println("Message sent");
   } else {
-    Serial.printf("sendReceive returned error %d, we'll try again later.\n", state);
+    Serial.println("sendLoRaMessage returned error we'll try again later: " + String(state));
     for (int8_t i = 0; i < messageBuffer.size(); i++) {
       messagesToSend.unshift(messageBuffer.get(i));
     }
@@ -352,7 +431,10 @@ void loop() {
       Serial.println(ntp.hours() + "-" + rtc.getHour(true));
       Serial.println(rtc.getDateTime());
       prefs->putBool("ntp", true);
+      prefs->putLong("lastNtp", rtc.getEpoch());
       ntp.stop();
+    } else if (rtc.getHour() >= 7 && prefs->getBool("ntp") == true && prefs->getLong("lastNtp") + (60 * 60 * 24) <= rtc.getEpoch()) {
+      prefs->putBool("ntp", false);
     }
 
     // TODO: Einmal pro Tag NTP zurücksetzen und neu synchronisieren, falls WLAN vorhanden

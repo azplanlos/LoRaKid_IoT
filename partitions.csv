@@ -1,0 +1,5 @@
+# Name,	Type,	SubType,	Offset,	Size,	Flags
+nvs,	data,	nvs,	0x9000,	0x7000,	
+app0,	app,	factory,	0x10000,	0x32e000,	
+spiffs,	data,	spiffs,	0x33e000,	0x4b2000,	
+coredump,	data,	coredump,	0x7f0000,	0x10000,	
