@@ -33,12 +33,15 @@
 #include <LittleFS.h>
 #include "FS.h"
 #include "DejaVu_Sans_Bold_10.h"
+#include <melody_factory.h>
+#include <melody_player.h>
 
 LoRaWANNode* node;
 
 RTC_DATA_ATTR uint8_t count = 0;
 
 #include "images.h"
+#include <HTTPClient.h>
 
 OLEDDisplayUi ui     ( &display );
 
@@ -47,6 +50,7 @@ LinkedList<Payload_KidPayload*> messageBuffer = LinkedList<Payload_KidPayload*>(
 Preferences* prefs = new Preferences();
 const char* TIMEZONE_OFFSET_KEY = "tzo";
 const char* HEARTBEAT = "hb";
+const char* stringsUrl = "https://lorakid.s3.eu-central-1.amazonaws.com/settings_public/kid.binpb";
 
 long lastMessage = 0;
 
@@ -69,8 +73,11 @@ bool active = false;
 ESP32Time rtc;
 WiFiUDP wifiUdp;
 NTP ntp(wifiUdp);
+HTTPClient http;
 
-long lastHeartbeat = 0;
+MelodyPlayer player(GPIO_NUM_33, 1, false);
+
+RTC_NOINIT_ATTR long lastHeartbeat = 0;
 
 void goToSleep() {
   Serial.println("Going to deep sleep now");
@@ -79,7 +86,6 @@ void goToSleep() {
   Serial.printf("Next wakeup in %i s\n", MINIMUM_DELAY);
   esp_sleep_enable_ext0_wakeup(BUTTON, LOW);
   button.waitForRelease();
-  prefs->putLong(HEARTBEAT, lastHeartbeat);
   prefs->end();
   delay(100);  // So message prints
   // and off to bed we go
@@ -105,7 +111,6 @@ void drawMessage(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int
   display->drawLine(x, y + 30, x + 45, y + 30);
   display->setFont(ArialMT_Plain_10);
   int width = display->getStringWidth(currentMessage);
-  Serial.println(String(state->frameState) + '-' + String(width) + '-' + String(messageScrollOffset) + '-' + String(state->ticksSinceLastStateSwitch));
   int xpos = x - messageScrollOffset;
   if (state->frameState == FIXED) {
     // scroll only if fixed!
@@ -118,6 +123,12 @@ void drawMessage(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int
     messageScrollOffset = 0;
   }
   int charsPrinted = display->drawString(xpos, y + 34, currentMessage);
+  display->setTextAlignment(TEXT_ALIGN_LEFT);
+  display->drawString(x, y + 52, "5 min");
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->drawString(x + 64, y + 52, "15 min");
+  display->setTextAlignment(TEXT_ALIGN_RIGHT);
+  display->drawString(x + 128, y + 52, "1h");
 }
 
 void drawFrame1(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
@@ -151,7 +162,7 @@ void drawFrame5(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int1
 FrameCallback frames[] = { drawMessage, drawFrame3, drawFrame4, drawFrame5 };
 
 // how many frames are there?
-int frameCount = 4;
+int frameCount = 1;
 
 // Overlays are statically drawn on top of a frame eg. a clock
 OverlayCallback overlays[] = { msOverlay };
@@ -173,19 +184,13 @@ void setup() {
   msgIconFile.read(messageIcon, 32);
   msgIconFile.close();
 
-  ledcSetup(0, 2000, 8);
-  ledcAttachPin(0, GPIO_NUM_33);
-  ledcWriteNote(0, NOTE_C, 4);
-  delay(500);
-  ledcDetachPin(GPIO_NUM_33);
-
   // The ESP is capable of rendering 60fps in 80Mhz mode
   // but that won't give you much time for anything else
   // run it in 160Mhz mode or just set it to 30 fps
   ui.setTargetFPS(15);
   ui.setTimePerFrame(24400);
 
-  //ui.disableAutoTransition();
+  ui.disableAutoTransition(true);
   ui.disableAllIndicators();
 
   // Customize the active and inactive symbol
@@ -218,14 +223,24 @@ void setup() {
     
     ui.update();
 
+    Melody melody = MelodyFactory.loadRtttlFile("/start.rttl", LittleFS);
+    if (!melody) {
+      Serial.println("Error");
+    } else {
+      Serial.println("Done!");
+
+      Serial.print("Playing ");
+      Serial.print(melody.getTitle());
+      Serial.print("... ");
+      player.playAsync(melody);
+    }
+
   } else {
     heltec_display_power(false);
     Serial.println(F("wakeup due to heartbeat"));
   }
 
-  lastHeartbeat = prefs->getLong(HEARTBEAT);
-
-  Serial.println("last heartbeat: " + String(lastHeartbeat) + " - " + hour(lastHeartbeat) + ":" + minute(lastHeartbeat));
+  Serial.println("last heartbeat: " + String(lastHeartbeat) + " - " + day(lastHeartbeat) + "." + month(lastHeartbeat) + "." + year(lastHeartbeat) + " " + hour(lastHeartbeat) + ":" + minute(lastHeartbeat));
   
   // initialize radio
   Serial.println("Radio init");
@@ -340,7 +355,7 @@ int16_t encodeAndSendMessage(const void* message, const pb_msgdesc_t* msgType) {
 }
 
 void sendLoRaHeartbeat() {
-  if (lastHeartbeat <= rtc.getEpoch() - (15 * 60) && joinAndCheckDutyCycle()) {
+  if ((lastHeartbeat <= rtc.getEpoch() - (15 * 60) || lastHeartbeat > rtc.getEpoch() + 60) && joinAndCheckDutyCycle() && !player.isPlaying()) {
     Payload_Heartbeat message = Payload_Heartbeat_init_zero;
     message.batteryLevel = (uint32_t)heltec_battery_percent();
     message.temp = (uint32_t)heltec_temperature();
@@ -432,6 +447,13 @@ void loop() {
       Serial.println(rtc.getDateTime());
       prefs->putBool("ntp", true);
       prefs->putLong("lastNtp", rtc.getEpoch());
+      Serial.println("Downloading " + String(stringsUrl));
+      http.begin(stringsUrl); //EXAMPLE image from internet
+      int httpCode = http.GET();
+      int size = http.getSize();
+      if (httpCode == 200) {
+        WiFiClient* stream = http.getStreamPtr();
+      }
       ntp.stop();
     } else if (rtc.getHour() >= 7 && prefs->getBool("ntp") == true && prefs->getLong("lastNtp") + (60 * 60 * 24) <= rtc.getEpoch()) {
       prefs->putBool("ntp", false);
